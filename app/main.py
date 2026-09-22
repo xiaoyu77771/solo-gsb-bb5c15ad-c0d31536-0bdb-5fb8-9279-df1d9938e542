@@ -11,6 +11,9 @@
                                            状态并返回片段长度多重集的概率分布（只读，不落库）
     POST /digests/{id}/methylation-analysis 只读分析甲基化对已保存酶切位点的阻断影响，
                                            重算保留切口并重建片段（不落库）
+    POST /gel-comparisons                只读比较 2~8 条已保存记录的凝胶条带：汇总片段
+                                           长度按降序聚类，返回条带范围、各泳道片段数、
+                                           总碱基数与诊断条带（不落库）
     GET  /health                           健康检查
 """
 
@@ -24,6 +27,7 @@ from fastapi import FastAPI, HTTPException
 from .db import Database
 from .digest import run_digest
 from .distribution import MAX_PARTIAL_CUTS, partial_digest_distribution
+from .gel import compare_gel_lanes
 from .methylation import analyze_methylation
 from .panel import plan_enzyme_panel
 from .schemas import (
@@ -33,6 +37,8 @@ from .schemas import (
     EnzymeIn,
     EnzymePanelPlanRequest,
     EnzymePanelPlanResponse,
+    GelComparisonRequest,
+    GelComparisonResponse,
     MethylationAnalysisRequest,
     MethylationAnalysisResponse,
     PartialDigestDistributionResponse,
@@ -321,4 +327,34 @@ def methylation_analysis(submission_id: int, request: MethylationAnalysisRequest
         "sequence_length": length,
         "methylated_positions": sorted(set(request.methylated_positions)),
         **analysis,
+    }
+
+
+@app.post("/gel-comparisons", response_model=GelComparisonResponse)
+def compare_gels(request: GelComparisonRequest) -> dict:
+    # 逐条确认记录存在：任一不存在即 404，按请求顺序报告第一个缺失 id
+    lanes = []
+    for digest_id in request.digest_ids:
+        record = db.get_submission(digest_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404, detail=f"submission {digest_id} not found"
+            )
+        lanes.append(
+            {
+                "digest_id": digest_id,
+                "fragment_lengths": [
+                    f["length"] for f in record["result"]["fragments"]
+                ],
+            }
+        )
+
+    # 仅在内存中汇总片段长度并聚类，数据库不做任何写入
+    bands = compare_gel_lanes(lanes, request.resolution_ratio)
+    return {
+        "digest_ids": list(request.digest_ids),
+        "resolution_ratio": request.resolution_ratio,
+        "lane_count": len(lanes),
+        "band_count": len(bands),
+        "bands": bands,
     }
