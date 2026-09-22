@@ -11,6 +11,7 @@
                                            状态并返回片段长度多重集的概率分布（只读，不落库）
     POST /digests/{id}/methylation-analysis 只读分析甲基化对已保存酶切位点的阻断影响，
                                            重算保留切口并重建片段（不落库）
+    POST /gel-comparisons                 只读比较 2~8 条已保存记录的凝胶条带（不落库）
     GET  /health                           健康检查
 """
 
@@ -24,6 +25,7 @@ from fastapi import FastAPI, HTTPException
 from .db import Database
 from .digest import run_digest
 from .distribution import MAX_PARTIAL_CUTS, partial_digest_distribution
+from .gel import build_gel_comparison
 from .methylation import analyze_methylation
 from .panel import plan_enzyme_panel
 from .schemas import (
@@ -33,6 +35,8 @@ from .schemas import (
     EnzymeIn,
     EnzymePanelPlanRequest,
     EnzymePanelPlanResponse,
+    GelComparisonRequest,
+    GelComparisonResponse,
     MethylationAnalysisRequest,
     MethylationAnalysisResponse,
     PartialDigestDistributionResponse,
@@ -321,4 +325,39 @@ def methylation_analysis(submission_id: int, request: MethylationAnalysisRequest
         "sequence_length": length,
         "methylated_positions": sorted(set(request.methylated_positions)),
         **analysis,
+    }
+
+
+@app.post("/gel-comparisons", response_model=GelComparisonResponse)
+def compare_gel_bands(request: GelComparisonRequest) -> dict:
+    # 重复 id、数量越界、ratio 越界已在模型层以 422 拒绝；
+    # 这里只需确认每条记录存在：任一不存在返回 404，且不泄露其它校验细节
+    records = []
+    missing = []
+    for digest_id in request.digest_ids:
+        record = db.get_submission(digest_id)
+        if record is None:
+            missing.append(digest_id)
+        else:
+            records.append(record)
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail="submission(s) not found: " + ", ".join(str(i) for i in missing),
+        )
+
+    # 泳道按 digest_id 升序归一化，使结果与请求条目的传入顺序无关
+    records.sort(key=lambda r: r["id"])
+    lengths_by_lane = [
+        (record["id"], [f["length"] for f in record["result"]["fragments"]])
+        for record in records
+    ]
+
+    # 仅在内存中聚类汇总，只读已保存结果，原记录与数据库均不改动
+    comparison = build_gel_comparison(lengths_by_lane, request.resolution_ratio)
+
+    return {
+        "resolution_ratio": request.resolution_ratio,
+        "lanes": comparison["lanes"],
+        "bands": comparison["bands"],
     }

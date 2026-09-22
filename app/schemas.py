@@ -409,3 +409,72 @@ class MethylationAnalysisResponse(BaseModel):
     removed_cuts: list[CutOut]
     fragments: list[FragmentOut]
 
+
+# ---------- 凝胶条带比较 ----------
+
+
+class GelComparisonRequest(BaseModel):
+    """凝胶条带比较请求：2~8 条不重复的已保存记录 + 分辨率比例。
+
+    重复 id、列表数量不在 2~8、resolution_ratio 不在闭区间 [0, 0.2]
+    （含 NaN / 无穷大）均以 422 拒绝；记录是否存在依赖数据库，
+    在路由中查询后判定，不存在返回 404。
+    """
+
+    digest_ids: list[int] = Field(min_length=2, max_length=8, examples=[[1, 2, 3]])
+    resolution_ratio: float = Field(
+        ge=0.0,
+        le=0.2,
+        description="条带分辨率：(max-min)/max <= ratio 视为同一条带",
+        examples=[0.1],
+    )
+
+    @field_validator("resolution_ratio")
+    @classmethod
+    def _ratio_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("resolution_ratio must be a finite number")
+        return v
+
+    @model_validator(mode="after")
+    def _no_duplicate_digest_ids(self) -> "GelComparisonRequest":
+        seen: set[int] = set()
+        duplicates: set[int] = set()
+        for digest_id in self.digest_ids:
+            if digest_id in seen:
+                duplicates.add(digest_id)
+            seen.add(digest_id)
+        if duplicates:
+            raise ValueError(
+                "duplicate digest ids: "
+                + ", ".join(str(i) for i in sorted(duplicates))
+            )
+        return self
+
+
+class GelLaneOut(BaseModel):
+    """一条泳道（一条已保存记录）：片段数与总碱基数。"""
+
+    digest_id: int
+    fragment_count: int
+    total_base_pairs: int
+
+
+class GelBandOut(BaseModel):
+    """一条凝胶条带：长度范围、落入其中的片段总数、覆盖泳道与诊断标记。"""
+
+    min_length: int
+    max_length: int
+    fragment_count: int
+    lanes: list[int]
+    diagnostic: bool
+
+
+class GelComparisonResponse(BaseModel):
+    """凝胶比较结果：条带按最大长度降序，泳道按 digest_id 升序。"""
+
+    resolution_ratio: float
+    lanes: list[GelLaneOut]
+    bands: list[GelBandOut]
+
+

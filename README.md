@@ -69,7 +69,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/digests/{id}/variant-analysis` | 对已保存记录施加一组单碱基替换并重跑酶切，返回切口与片段长度差异（不落库，记录不存在返回 404） |
 | `POST` | `/digests/{id}/enzyme-panel-plan` | 枚举候选酶组合，寻找达到目标片段数的最少酶集合（只读不落库，记录不存在返回 404，无解返回 422） |
 | `POST` | `/digests/{id}/partial-digest-distribution` | 为每个已保存物理切口指定独立切割概率，枚举成功/失败状态并返回片段长度多重集的概率分布（只读不落库，记录不存在返回 404） |
-| `POST` | `/digests/{id}/methylation-analysis` | 只读分析甲基化对已保存酶切位点的阻断影响：按酶的敏感偏移定位甲基化碱基，阻断/保留/移除切口并重建片段（不落库，记录不存在返回 404） |
+| `POST` | `/digests/{id}/methylation-analysis` | 对已保存酶切位点施加甲基化阻断规则并重算片段（只读不落库，记录不存在返回 404） |
+| `POST` | `/gel-comparisons` | 只读比较 2~8 条已保存记录的凝胶条带：按分辨率聚类片段长度并标出诊断条带（不落库，任一记录不存在返回 404） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交示例
@@ -454,6 +455,86 @@ curl -X POST http://localhost:8000/digests/1/methylation-analysis \
 | 敏感偏移超出 `[0, len(pattern)-1]`（含负数） | **422** |
 | `methylated_positions` 或 `enzyme_rules` 为空列表 | **422** |
 
+## 凝胶条带比较
+
+把 **2~8 条已保存的酶切记录**当作凝胶上的若干**泳道**，汇总各泳道全部片段的
+长度，在给定的**分辨率比例**下聚类为凝胶条带：同一电泳位置上相互对齐的片段
+归为一条条带。**比较过程不写库**：只读取已保存结果，原记录保持不变，也不会
+产生新的提交。
+
+### 条带聚类口径（禁止链式归并）
+
+片段按长度**降序**逐条处理，条带以其**最大长度（锚点）**成簇：
+
+- 片段并入当前条带的条件为
+  **`(条带最大长度 - 该片段长度) / 条带最大长度 <= resolution_ratio`**，
+  并入后条带最小长度更新；不满足则以该片段为新锚点**另开一条条带**。
+- 因此每一条条带都严格满足 `(max_length - min_length) / max_length <= ratio`。
+- 该口径**不会产生"相邻可合并、首尾超差"的链式归并**：降序处理时，若一个片段
+  连锚点最小（最新）的条带都进不去，则它对锚点更大的旧条带必然超差，只能另开
+  新条带。例如长度 `100, 95, 90, 85`、比例 `0.1` 时结果是 `[90,100]` 与
+  `[85,85]` 两条带，而**不会**得到首尾相差 15% 的 `[85,100]`。
+- `resolution_ratio = 0` 时只有长度完全相同的片段才会同带。
+
+### 请求
+
+服务地址为 **http://localhost:8000**（容器内 8000 端口，compose 映射到宿主机
+同一端口）：
+
+```bash
+curl -X POST http://localhost:8000/gel-comparisons \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "digest_ids": [1, 2, 3],
+    "resolution_ratio": 0.1
+  }'
+```
+
+- `digest_ids`：**2~8 个**已保存记录的 id，**不可重复**；泳道在结果中按 id
+  升序归一化，因此条目的传入顺序不影响结果。
+- `resolution_ratio`：条带分辨率，闭区间 **`[0, 0.2]`**（即最多容忍 20% 的长度
+  相对偏差）；`NaN` / 无穷大 / 越界均为 **422**。
+
+### 响应
+
+```json
+{
+  "resolution_ratio": 0.1,
+  "lanes": [
+    {"digest_id": 1, "fragment_count": 2, "total_base_pairs": 14},
+    {"digest_id": 2, "fragment_count": 3, "total_base_pairs": 20},
+    {"digest_id": 3, "fragment_count": 2, "total_base_pairs": 16}
+  ],
+  "bands": [
+    {"min_length": 9, "max_length": 10, "fragment_count": 2,
+     "lanes": [2, 3], "diagnostic": false},
+    {"min_length": 5, "max_length": 5, "fragment_count": 3,
+     "lanes": [1, 2, 3], "diagnostic": false},
+    {"min_length": 6, "max_length": 6, "fragment_count": 1,
+     "lanes": [3], "diagnostic": true}
+  ]
+}
+```
+
+- `lanes[]`：每条泳道（一条已保存记录）的 `fragment_count`（片段数）与
+  `total_base_pairs`（全部片段长度之和，即该泳道总碱基数），按 `digest_id`
+  升序返回。
+- `bands[]`：按 `max_length` **降序稳定排列**的条带：
+  - `min_length` / `max_length`：该条带覆盖的片段长度范围；
+  - `fragment_count`：落入该条带的片段**多重集**总数（同一泳道的多个等长片段
+    也会分别计数）；
+  - `lanes`：该条带出现于哪些泳道（按 id 升序）；
+  - `diagnostic`：**仅出现在一个泳道**的条带标记为 `true`，即凝胶上的诊断条带。
+
+### 校验与状态码
+
+| 情形 | 状态码 |
+| --- | --- |
+| 任一 `digest_id` 对应的记录不存在（含负数 id） | **404** |
+| `digest_ids` 少于 2 个或多于 8 个 | **422** |
+| `digest_ids` 中出现重复 id | **422** |
+| `resolution_ratio` 不在 `[0, 0.2]`（含 `NaN` / 无穷大） | **422** |
+
 
 
 - **坐标**：均为 0-based，作用于 top 链（提交序列方向）；切口位置 `c` 表示断裂
@@ -494,6 +575,7 @@ app/
 ├── panel.py     # 酶组合面板规划（枚举候选组合、最少酶择优）
 ├── distribution.py  # 部分酶切概率分布（枚举成功/失败状态、长度多重集合并）
 ├── methylation.py   # 甲基化阻断分析（敏感位点定位、切口保留/移除、片段重建）
+├── gel.py       # 凝胶条带比较（多泳道片段长度按分辨率聚类、诊断条带）
 ├── iupac.py     # IUPAC 编码表与反向互补
 ├── schemas.py   # 请求/响应模型与校验
 └── db.py        # SQLite 持久化（启动时自动建表）
@@ -503,7 +585,8 @@ tests/
 ├── test_variant_api.py  # 变异影响分析 API 测试
 ├── test_panel_api.py    # 酶组合面板规划 API 测试
 ├── test_distribution_api.py  # 部分酶切概率分布 API 测试
-└── test_methylation_api.py   # 甲基化阻断分析 API 测试
+├── test_methylation_api.py   # 甲基化阻断分析 API 测试
+└── test_gel_api.py      # 凝胶条带比较 API 与聚类算法测试
 Dockerfile
 docker-compose.yml
 requirements.txt
